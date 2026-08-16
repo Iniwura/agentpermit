@@ -1,0 +1,19 @@
+{
+  "name": "agentpermit",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "genlayer deploy",
+    "app:build": "npm --prefix app run build"
+  },
+  "devDependencies": {
+    "genlayer-js": "^1.2.0"
+  },
+  "version": "1.0.0",
+  "description": "**Authorization infrastructure for autonomous agents.**",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "keywords": []
+}

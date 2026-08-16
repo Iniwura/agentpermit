@@ -1,0 +1,10 @@
+.env
+.venv/
+node_modules/
+dist/
+artifacts/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.orig
+*.rej
