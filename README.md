@@ -142,9 +142,13 @@ Routes include `/`, `/app`, `/app/agents`, `/app/requests`, `/app/requests/new`,
 
 ## Testing
 
-Current result: **64 tests passing**.
+Contract tests: **64 passing**.
+Execution-gate tests: **7 passing**.
+Full pytest result: **71 passing**.
 
 Coverage includes ownership, mandate versioning, request creation, evidence failures, `PERMITTED`, `DENIED`, `NEEDS_EVIDENCE`, decision consensus, tolerant policy-ID normalization, validator error handling, exactly one web GET per source, no `web.render`, fail-closed behavior, and `can_execute` gating.
++
+Execution-gate coverage includes blocked execution, payload forwarding, duplicate protection, target exceptions and explicit failure values, retry after failure, and execution-time authorization refresh.
 
 ## Local Setup
 
@@ -177,6 +181,32 @@ The deployment script targets `contracts/agent_permit.py` and validates the curr
 - Bradbury is a testnet.
 - Web availability can vary; required evidence failures fail closed.
 - Permit JSON is not independently signed.
-- AgentPermit authorizes; it does not execute actions or hold funds.
-- Downstream systems must explicitly enforce the permit.
-- Production use requires deeper security review, identity binding, replay protection, and idempotent execution controls.
+- The repository includes a reference enforcement adapter, AgentPermitExecutionGate, that consumes can_execute(request_id) before forwarding a target call.
+- Real production integrations must place the adapter, or equivalent logic, directly in their actual tool, wallet, API, or infrastructure execution path.
+- The Python adapter does not automatically secure arbitrary external systems.
+- Production identity binding, replay/idempotency controls, and downstream failure semantics still require deeper integration and security review.
+
+## Execution Enforcement
+
+AgentPermit does not stop at producing a permit. The repository includes AgentPermitExecutionGate, a reference enforcement consumer that calls can_execute(request_id) immediately before forwarding a downstream tool, wallet, API, or infrastructure action.
+
+```text
+Agent Permission Request
+↓
+GenLayer Authorization
+↓
+can_execute(request_id)
+↓
+AgentPermitExecutionGate
+↓ false                  ↓ true
+execution blocked        downstream action executed
+```
+
+- AgentPermit Intelligent Contract = authorization source.
+- AgentPermitExecutionGate = enforcement consumer.
+- Copied permit JSON, a permit ID, or a request decision is not trusted as authorization.
+- Authorization is reread at execution time; the gate does not cache it.
+- Duplicate execution protection is included per gate instance.
+- Downstream failures do not consume the request, so retry remains possible.
+
+The gate uses a small target.call(payload) protocol. It is a reference adapter, not a wallet, API gateway, or claim that arbitrary external systems are secured automatically.
