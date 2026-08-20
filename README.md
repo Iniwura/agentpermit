@@ -50,7 +50,7 @@ The consensus-critical field is `decision`. `evidence_state`, `relevant_policy_i
 | `DENIED` | None | `false` |
 | `NEEDS_EVIDENCE` | None | `false` |
 
-The frontend treats the stored contract decision and `can_execute()` as the source of truth. An `ACCEPTED` transaction alone does not imply authorization.
+The frontend treats the stored contract decision and exact-scope can_execute(action_id, target, payload_hash) result as the source of truth. An ACCEPTED transaction alone does not imply authorization.
 
 ## Evidence Safety
 
@@ -62,34 +62,65 @@ The frontend treats the stored contract decision and `can_execute()` as the sour
 
 ## Scoped Permits
 
-The frontend derives a permit only when:
+The frontend lists every stored PERMITTED decision as a historical permit and shows exact-scope execution authorization separately. An active execution permit is bound to one target, one payload commitment, one expiry, and one lifecycle state; a decision alone is never enough. Permit IDs are deterministic display identifiers such as AP-0001 and AP-0002. Permit JSON is a machine-readable representation of current onchain authorization state; it is not cryptographically signed.
 
-```text
-decision == "PERMITTED"
-and
-can_execute == true
-```
+Downstream tools, wallets, and APIs must enforce the exact permit scope before execution. They should pass the same target identity and payload commitment to can_execute(action_id, target, payload_hash), then call consume_permit(action_id, target, payload_hash) immediately before the external call. Copied permit JSON, a display ID, or a decision string is not an authorization token.
 
-Permit IDs are deterministic display identifiers such as `AP-0001` and `AP-0002`. Permit JSON is a machine-readable representation of current onchain authorization state; it is not cryptographically signed.
+## Permit Scope & Lifecycle
+
+A permit is executable only when every gate below succeeds:
+
+~~~text
+APPROVED ACTION
+↓
+EXACT TARGET
+↓
+EXACT PAYLOAD COMMITMENT
+↓
+NOT EXPIRED
+↓
+NOT REVOKED
+↓
+NOT CONSUMED
+↓
+can_execute(action_id, target, payload_hash)
+↓
+consume_permit(action_id, target, payload_hash)
+↓
+Execution Boundary
+↓
+Target
+~~~
+
+- target is the exact downstream identity. The contract stores it with the action and rejects any mismatch.
+- payload_hash is the SHA-256 digest of the exact UTF-8 canonical payload string. Plain text is hashed byte-for-byte; top-level JSON objects/lists are compacted with sorted keys, compact separators, UTF-8 characters, and strict JSON values before submission. Top-level numbers, booleans, null, and bytes are rejected to avoid type collisions.
+- Expiry uses the GenLayer transaction datetime at one-second precision from gl.message_raw[datetime]. Fractional seconds are truncated; a missing or malformed runtime value fails closed. The boundary is inclusive: current_time is less than or equal to expires_at.
+- The contract owner has emergency/admin authority to revoke any permit; the registered agent owner can revoke permits for that agent. Revocation is irreversible.
+- consume_permit performs the same checks as can_execute and marks the permit consumed exactly once. A replay, scope mismatch, expiry, revocation, or failed authorization lookup is blocked.
+- Consumption authorizes one execution attempt, not a guaranteed successful external action. It happens before the non-atomic target call; if that call fails, the permit remains consumed and replay is blocked.
 
 ## Machine-Readable Permit
 
-```json
+~~~json
 {
   "permit_id": "AP-0002",
   "agent_id": 1,
   "request_id": 2,
   "capability": "PAYMENT",
   "target": "Vercel",
+  "payload_hash": "sha256-of-exact-payload",
   "amount": "120",
   "asset": "USDC",
   "mandate_version": 1,
   "authorization": "PERMITTED",
+  "expires_at": "2099-01-01T00:00:00Z",
+  "revoked": false,
+  "consumed": false,
   "can_execute": true
 }
-```
+~~~
 
-Downstream tools, wallets, and APIs must explicitly choose to check AgentPermit before execution and should apply their own replay and idempotency controls.
+Downstream tools, wallets, and APIs must enforce the exact scope and lifecycle through the contract immediately before execution; a copied JSON object, display ID, or decision string is not an authorization token.
 
 ## Demo Example
 
@@ -112,7 +143,7 @@ Fail-closed flow:
 
 ## Architecture
 
-```text
+~~~text
 React/Vite frontend
 ↓
 GenLayer JS
@@ -125,8 +156,10 @@ Validator consensus
 ↓
 Onchain authorization decision
 ↓
-Permit derivation / can_execute
-```
+can_execute / consume_permit
+↓
+Execution enforcement boundary
+~~~
 
 ## Frontend
 
@@ -134,21 +167,22 @@ The React control plane provides wallet connect/disconnect and account switching
 
 Routes include `/`, `/app`, `/app/agents`, `/app/requests`, `/app/requests/new`, `/app/requests/:id`, `/app/permits`, `/app/permits/:id`, and `/app/policy`.
 
+The frontend is migrated to the hardened ABI. Permission requests collect an exact target, raw or structured JSON payload, and expiry; structured payloads are recursively key-sorted and compacted before a Web Crypto SHA-256 preview. The API submits the 12-argument propose_action call and reads can_execute(action_id, target, payload_hash) with the same scope. Policy decision and execution authorization are displayed separately, historical permits remain visible, and revocation rereads the action after its persisted transaction reaches finality. All deployment-scoped frontend state uses v5 keys scoped to the lowercase deployed contract address, including revocations.
+
 ## Contract
 
 - Network: GenLayer Bradbury testnet
-- Contract: `0xb1DbF4AA85B585652bD2d453CAb2c1426fFB70E8`
-- Contract logic and public ABI are deployed and must not be changed for this submission pass.
+- Contract: `0xac363BA858c1FC97fA1477aF3DE52C238a491978`
+- The deployed Bradbury address exposes the hardened scope/lifecycle ABI used by the frontend; this migration does not redeploy the contract.
 
 ## Testing
 
-Contract tests: **64 passing**.
-Execution-gate tests: **7 passing**.
-Full pytest result: **71 passing**.
+Contract tests: **83 passing**.
+Execution-gate tests: **25 passing**.
+Full pytest result: **108 passing**.
 
-Coverage includes ownership, mandate versioning, request creation, evidence failures, `PERMITTED`, `DENIED`, `NEEDS_EVIDENCE`, decision consensus, tolerant policy-ID normalization, validator error handling, exactly one web GET per source, no `web.render`, fail-closed behavior, and `can_execute` gating.
-+
-Execution-gate coverage includes blocked execution, payload forwarding, duplicate protection, target exceptions and explicit failure values, retry after failure, and execution-time authorization refresh.
+Coverage includes exact payload canonicalization, object key ordering, array ordering, Unicode/nested JSON, scalar rejection, exact target matching, ownership, mandate versioning, request creation, evidence failures, PERMITTED, DENIED, NEEDS_EVIDENCE, decision consensus, tolerant policy-ID normalization, validator error handling, exactly one web GET per source, no web.render, fail-closed behavior, expiry boundaries, revocation, consumption, replay prevention, malformed runtime-clock fail-closed behavior, and exact-scope can_execute gating.
+Execution-gate coverage includes exact scope forwarding, blocked execution, deterministic payload hashing, duplicate protection, target exceptions and explicit failure values, fail-closed authorization/consumption errors, and execution-time authorization refresh.
 
 ## Local Setup
 
@@ -170,6 +204,7 @@ npm run build
 cd /home/ini/agentpermit
 gltest test/test_agent_permit.py -v
 genvm-lint check contracts/agent_permit.py
+pytest -q
 ```
 
 ## Deployment
@@ -179,34 +214,40 @@ The deployment script targets `contracts/agent_permit.py` and validates the curr
 ## Security / Limitations
 
 - Bradbury is a testnet.
+- Permit expiry reads the transaction datetime supplied in gl.message_raw. If the target runtime omits or misreports it, the contract fails closed; verify this field on Bradbury before redeployment.
 - Web availability can vary; required evidence failures fail closed.
 - Permit JSON is not independently signed.
-- The repository includes a reference enforcement adapter, AgentPermitExecutionGate, that consumes can_execute(request_id) before forwarding a target call.
+- The repository includes a reference enforcement adapter, AgentPermitExecutionGate, that derives the exact target and payload hash, calls can_execute(request_id, target, payload_hash), then consumes the permit before forwarding a target call.
 - Real production integrations must place the adapter, or equivalent logic, directly in their actual tool, wallet, API, or infrastructure execution path.
 - The Python adapter does not automatically secure arbitrary external systems.
 - Production identity binding, replay/idempotency controls, and downstream failure semantics still require deeper integration and security review.
 
 ## Execution Enforcement
 
-AgentPermit does not stop at producing a permit. The repository includes AgentPermitExecutionGate, a reference enforcement consumer that calls can_execute(request_id) immediately before forwarding a downstream tool, wallet, API, or infrastructure action.
+AgentPermit does not stop at producing a permit. The repository includes AgentPermitExecutionGate, a reference enforcement consumer that derives the exact target identity and payload commitment, calls can_execute(request_id, target, payload_hash), consumes the permit, and only then forwards a downstream tool, wallet, API, or infrastructure action.
 
-```text
+~~~text
 Agent Permission Request
 ↓
 GenLayer Authorization
 ↓
-can_execute(request_id)
+Exact target + payload hash
+↓
+can_execute(action_id, target, payload_hash)
+↓
+consume_permit(action_id, target, payload_hash)
 ↓
 AgentPermitExecutionGate
-↓ false                  ↓ true
-execution blocked        downstream action executed
-```
+↓ false                         ↓ true
+execution blocked               downstream action executed
+                                 (permit is now consumed)
+~~~
 
 - AgentPermit Intelligent Contract = authorization source.
 - AgentPermitExecutionGate = enforcement consumer.
 - Copied permit JSON, a permit ID, or a request decision is not trusted as authorization.
-- Authorization is reread at execution time; the gate does not cache it.
-- Duplicate execution protection is included per gate instance.
-- Downstream failures do not consume the request, so retry remains possible.
+- Authorization and consumption are reread at execution time; the gate does not cache contract state.
+- Duplicate execution protection is included per gate instance and by contract-level consumed state.
+- Consumption precedes the non-atomic external call. If the target fails, the permit remains consumed and replay is blocked.
 
 The gate uses a small target.call(payload) protocol. It is a reference adapter, not a wallet, API gateway, or claim that arbitrary external systems are secured automatically.

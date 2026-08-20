@@ -2,6 +2,7 @@
 
 from genlayer import *
 from dataclasses import dataclass
+import hashlib
 import json
 import typing
 
@@ -61,6 +62,56 @@ def _policy_labels(policy_ids: list[str]) -> str:
     return ", ".join(value.replace("POLICY_", "").replace("_", " ").title() for value in policy_ids)
 
 
+def _payload_commitment(payload: str) -> str:
+    if not isinstance(payload, str):
+        raise gl.vm.UserError("Payload must be provided as text")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_expiry(expires_at: str) -> str:
+    if not isinstance(expires_at, str) or len(expires_at) != 20 or not expires_at.endswith("Z"):
+        raise gl.vm.UserError("Expiry must use UTC format YYYY-MM-DDTHH:MM:SSZ")
+    if expires_at[4] != "-" or expires_at[7] != "-" or expires_at[10] != "T":
+        raise gl.vm.UserError("Expiry must use UTC format YYYY-MM-DDTHH:MM:SSZ")
+    if expires_at[13] != ":" or expires_at[16] != ":":
+        raise gl.vm.UserError("Expiry must use UTC format YYYY-MM-DDTHH:MM:SSZ")
+    digits = expires_at[0:4] + expires_at[5:7] + expires_at[8:10] + expires_at[11:13] + expires_at[14:16] + expires_at[17:19]
+    if not digits.isdigit():
+        raise gl.vm.UserError("Expiry must use UTC format YYYY-MM-DDTHH:MM:SSZ")
+    month = int(expires_at[5:7])
+    day = int(expires_at[8:10])
+    hour = int(expires_at[11:13])
+    minute = int(expires_at[14:16])
+    second = int(expires_at[17:19])
+    if month < 1 or month > 12 or day < 1 or day > 31:
+        raise gl.vm.UserError("Expiry date is invalid")
+    if hour > 23 or minute > 59 or second > 59:
+        raise gl.vm.UserError("Expiry time is invalid")
+    return expires_at
+
+
+def _runtime_time() -> str:
+    # The runtime supplies the transaction datetime through message_raw.
+    # Fractional seconds are truncated to the contract's one-second precision.
+    raw_message = getattr(gl, "message_raw", {})
+    if not isinstance(raw_message, dict):
+        return ""
+    raw_time = raw_message.get("datetime", "")
+    if not isinstance(raw_time, str) or len(raw_time) == 0:
+        return ""
+    normalized = raw_time
+    if len(raw_time) > 20 and raw_time.endswith("Z") and raw_time[19] == ".":
+        fraction = raw_time[20:-1]
+        if not fraction.isdigit():
+            return ""
+        normalized = raw_time[:19] + "Z"
+    try:
+        _validate_expiry(normalized)
+    except Exception:
+        return ""
+    return normalized
+
+
 @allow_storage
 @dataclass
 class Agent:
@@ -79,6 +130,9 @@ class Action:
     description: str
     action_type: str
     recipient: str
+    target: str
+    payload_hash: str
+    expires_at: str
     amount: str
     asset: str
     purpose: str
@@ -94,6 +148,8 @@ class Action:
     relevant_policy_ids: DynArray[str]
     relevant_policies: str
     evidence_summary: str
+    revoked: bool
+    consumed: bool
 
 
 class AgentPermit(gl.Contract):
@@ -120,6 +176,52 @@ class AgentPermit(gl.Contract):
     def _require_agent_owner(self, agent: Agent) -> None:
         if gl.message.sender_address != agent.owner:
             raise gl.vm.UserError("Only the agent owner can perform this action")
+
+    def _runtime_is_expired(self, expires_at: str) -> bool:
+        current = _runtime_time()
+        if len(current) == 0:
+            return True
+        return current > expires_at
+
+    def _require_action(self, action_id: u256) -> Action:
+        if action_id not in self.actions:
+            raise gl.vm.UserError("Action does not exist")
+        return self.actions[action_id]
+
+    def _is_executable(self, action: Action, target: str, payload_hash: str) -> bool:
+        # Missing or malformed lifecycle/scope fields are never executable.
+        if getattr(action, "status", None) != "APPROVED":
+            return False
+        if getattr(action, "decision", None) != "PERMITTED":
+            return False
+        if getattr(action, "revoked", None) is not False:
+            return False
+        if getattr(action, "consumed", None) is not False:
+            return False
+        stored_target = getattr(action, "target", None)
+        stored_hash = getattr(action, "payload_hash", None)
+        expires_at = getattr(action, "expires_at", None)
+        if not isinstance(target, str) or not isinstance(payload_hash, str):
+            return False
+        if not isinstance(stored_target, str) or not stored_target:
+            return False
+        if not isinstance(stored_hash, str) or not stored_hash:
+            return False
+        if not isinstance(expires_at, str) or not expires_at:
+            return False
+        try:
+            _validate_expiry(expires_at)
+        except Exception:
+            return False
+        if target != stored_target or payload_hash != stored_hash:
+            return False
+        return not self._runtime_is_expired(expires_at)
+
+    def _require_action_authority(self, action: Action) -> None:
+        agent = self._require_agent(action.agent_id)
+        sender = gl.message.sender_address
+        if sender != self.owner and sender != agent.owner:
+            raise gl.vm.UserError("Only the contract or agent owner can manage this permit")
 
     def _validate_urls(self, evidence_urls: typing.Any) -> list[str]:
         if not isinstance(evidence_urls, list):
@@ -182,6 +284,8 @@ class AgentPermit(gl.Contract):
         purpose: str,
         evidence: str,
         evidence_urls: typing.Any,
+        payload: str,
+        expires_at: str,
     ) -> None:
         agent = self._require_agent(agent_id)
         if not agent.active:
@@ -194,11 +298,14 @@ class AgentPermit(gl.Contract):
             if len(value.strip()) == 0:
                 raise gl.vm.UserError(label + " cannot be empty")
         urls = self._validate_urls(evidence_urls)
+        payload_hash = _payload_commitment(payload)
+        validated_expiry = _validate_expiry(expires_at)
         action_id = u256(int(self.action_count) + 1)
         self.actions[action_id] = Action(
-            agent_id, title, description, action_type, recipient, amount, asset,
-            purpose, evidence, urls, len(urls) > 0, agent.mandate_version,
-            gl.message.sender_address, "PENDING_REVIEW", "", "", "", [], "", "",
+            agent_id, title, description, action_type, recipient, recipient,
+            payload_hash, validated_expiry, amount, asset, purpose, evidence,
+            urls, len(urls) > 0, agent.mandate_version, gl.message.sender_address,
+            "PENDING_REVIEW", "", "", "", [], "", "", False, False,
         )
         self.action_count = action_id
 
@@ -393,8 +500,24 @@ Return ONLY structured JSON:
         return self.mandate_history[key]
 
     @gl.public.view
-    def can_execute(self, action_id: u256) -> bool:
+    def can_execute(self, action_id: u256, target: str, payload_hash: str) -> bool:
         if action_id not in self.actions:
             return False
-        action = self.actions[action_id]
-        return action.status == "APPROVED" and action.decision == "PERMITTED"
+        return self._is_executable(self.actions[action_id], target, payload_hash)
+
+    @gl.public.write
+    def consume_permit(self, action_id: u256, target: str, payload_hash: str) -> None:
+        action = self._require_action(action_id)
+        if not self._is_executable(action, target, payload_hash):
+            raise gl.vm.UserError("Permit is not executable")
+        action.consumed = True
+        self.actions[action_id] = action
+
+    @gl.public.write
+    def revoke_permit(self, action_id: u256) -> None:
+        action = self._require_action(action_id)
+        self._require_action_authority(action)
+        if action.revoked:
+            raise gl.vm.UserError("Permit is already revoked")
+        action.revoked = True
+        self.actions[action_id] = action

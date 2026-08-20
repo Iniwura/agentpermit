@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pytest
 
@@ -7,6 +8,8 @@ MANDATE = (
     "infrastructure, API access, and research tools. Must not transfer funds "
     "to personal wallets. Material factual claims require verifiable evidence."
 )
+PAYLOAD = '{\"amount\":\"300\",\"asset\":\"USDC\",\"purpose\":\"One month of GPU infrastructure\"}'
+EXPIRY = "2099-01-01T00:00:00Z"
 
 
 def deploy(direct_deploy):
@@ -17,11 +20,19 @@ def create_agent(contract, mandate=MANDATE):
     contract.create_agent("ResearchOps-01", mandate)
 
 
-def propose(contract, *, recipient="Cloud Compute Inc.", amount="300", purpose="One month of GPU infrastructure", urls=None):
+def propose(contract, *, recipient="Cloud Compute Inc.", amount="300", purpose="One month of GPU infrastructure", urls=None, payload=PAYLOAD, expires_at=EXPIRY):
     contract.propose_action(
         1, "GPU compute", "Pay for a month of GPU infrastructure", "PAYMENT",
         recipient, amount, "USDC", purpose, "Provider offers GPU compute.", urls or [],
+        payload, expires_at,
     )
+
+def payload_hash(payload):
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def execution_scope(contract, action_id=1):
+    action = contract.get_action(action_id)
+    return action.target, action.payload_hash
 
 
 def response(decision="PERMITTED", evidence_state="SUFFICIENT", ids=None, reasoning="Within mandate.", summary="Facts established.", **extra):
@@ -134,7 +145,7 @@ def test_propose_action(direct_deploy):
 def test_invalid_agent_rejected(direct_vm, direct_deploy):
     contract = deploy(direct_deploy)
     with direct_vm.expect_revert("Agent does not exist"):
-        contract.propose_action(99, "A", "B", "C", "D", "1", "USDC", "P", "", [])
+        contract.propose_action(99, "A", "B", "C", "D", "1", "USDC", "P", "", [], PAYLOAD, EXPIRY)
 
 
 @pytest.mark.parametrize("urls,message", [
@@ -164,7 +175,7 @@ def test_decision_mapping_and_execution_gate(direct_vm, direct_deploy, decision,
     action = contract.get_action(1)
     assert action.decision == decision
     assert action.status == status
-    assert contract.can_execute(1) is allowed
+    assert contract.can_execute(1, *execution_scope(contract)) is allowed
 
 
 def test_denied_forbidden_recipient_and_purpose(direct_vm, direct_deploy):
@@ -187,7 +198,7 @@ def test_required_unavailable_evidence_cannot_permit(direct_vm, direct_deploy):
     action = contract.get_action(1)
     assert action.decision == "NEEDS_EVIDENCE"
     assert action.evidence_state == "UNAVAILABLE"
-    assert contract.can_execute(1) is False
+    assert contract.can_execute(1, *execution_scope(contract)) is False
 
 
 def test_consensus_ignores_reasoning_wording(direct_vm, direct_deploy):
@@ -255,7 +266,7 @@ def test_policy_id_formatting_does_not_change_permitted_decision(direct_vm, dire
     contract.review_action(1)
     action = contract.get_action(1)
     assert action.decision == "PERMITTED"
-    assert contract.can_execute(1) is True
+    assert contract.can_execute(1, *execution_scope(contract)) is True
 
 
 def test_validator_path_accepts_tolerant_policy_ids(direct_vm, direct_deploy):
@@ -312,7 +323,7 @@ def test_action_uses_mandate_version_at_submission(direct_vm, direct_deploy):
 
 
 def test_missing_action_cannot_execute(direct_deploy):
-    assert deploy(direct_deploy).can_execute(999) is False
+    assert deploy(direct_deploy).can_execute(999, "Cloud Compute Inc.", payload_hash(PAYLOAD)) is False
 
 
 def test_pickling_and_validator_error_handling(direct_vm, direct_deploy):
@@ -363,7 +374,7 @@ def test_http_evidence_failure_is_conservative(direct_vm, direct_deploy, status)
     action = contract.get_action(1)
     assert action.decision == "NEEDS_EVIDENCE"
     assert action.evidence_state == "UNAVAILABLE"
-    assert contract.can_execute(1) is False
+    assert contract.can_execute(1, *execution_scope(contract)) is False
 
 
 def test_evidence_request_exception_is_conservative(direct_vm, direct_deploy):
@@ -379,7 +390,7 @@ def test_evidence_request_exception_is_conservative(direct_vm, direct_deploy):
     contract.review_action(1)
     action = contract.get_action(1)
     assert action.decision == "NEEDS_EVIDENCE"
-    assert contract.can_execute(1) is False
+    assert contract.can_execute(1, *execution_scope(contract)) is False
 
 
 def test_exactly_one_get_and_never_render_per_evidence_url(direct_vm, direct_deploy):
@@ -433,7 +444,7 @@ def test_multiple_urls_with_one_failure_remain_fail_closed(direct_vm, direct_dep
     mock_review(direct_vm, response("PERMITTED", "SUFFICIENT"))
     contract.review_action(1)
     assert contract.get_action(1).decision == "NEEDS_EVIDENCE"
-    assert contract.can_execute(1) is False
+    assert contract.can_execute(1, *execution_scope(contract)) is False
 
 
 def test_permitted_and_needs_evidence_disagree(direct_vm, direct_deploy):
@@ -476,3 +487,182 @@ def _prepare_validator_case(direct_vm, direct_deploy):
     mock_review(direct_vm, response("PERMITTED", "SUFFICIENT"))
     contract.review_action(1)
     return contract, url
+
+
+def approve_action(direct_vm, contract, *, payload=PAYLOAD, expires_at=EXPIRY, action_id=1):
+    mock_review(direct_vm, response())
+    contract.review_action(action_id)
+    return execution_scope(contract, action_id)
+
+
+def warp_contract_time(direct_vm, timestamp):
+    direct_vm.warp(timestamp)
+    from genlayer import gl
+    gl.message_raw["datetime"] = timestamp
+
+
+def test_gate_and_contract_hash_same_canonical_json(direct_deploy):
+    payload = {"nested": {"z": "é", "a": [True, None, 3.5]}, "b": 2}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, payload=canonical)
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert contract.get_action(1).payload_hash == expected
+
+
+def test_exact_scope_target_and_payload_succeeds(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    target, commitment = approve_action(direct_vm, contract)
+    assert contract.can_execute(1, target, commitment) is True
+
+
+@pytest.mark.parametrize("target,payload", [
+    ("Cloud Compute Inc.", PAYLOAD + " "),
+    ("Different Target", PAYLOAD),
+    ("Different Target", PAYLOAD + " "),
+    ("cloud compute inc.", PAYLOAD),
+    ("Cloud Compute Inc. ", PAYLOAD),
+])
+def test_wrong_scope_fails_closed(direct_vm, direct_deploy, target, payload):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    approved_target, approved_hash = approve_action(direct_vm, contract)
+    assert contract.can_execute(1, target, payload_hash(payload)) is False
+    assert contract.can_execute(1, approved_target, approved_hash) is True
+
+
+def test_payload_one_character_difference_fails(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, payload="")
+    target, commitment = approve_action(direct_vm, contract, payload="")
+    assert contract.can_execute(1, target, commitment) is True
+    assert contract.can_execute(1, target, payload_hash("x")) is False
+
+
+def test_duplicate_descriptions_with_different_payloads_do_not_share_scope(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, payload="payload-one")
+    propose(contract, payload="payload-two")
+    approve_action(direct_vm, contract, payload="payload-one", action_id=1)
+    approve_action(direct_vm, contract, payload="payload-two", action_id=2)
+    target_one, hash_one = execution_scope(contract, 1)
+    target_two, hash_two = execution_scope(contract, 2)
+    assert contract.can_execute(1, target_one, hash_one) is True
+    assert contract.can_execute(2, target_one, hash_one) is False
+    assert contract.can_execute(2, target_two, hash_two) is True
+
+
+def test_expiry_valid_before_boundary_and_expired_after(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, expires_at="2030-01-01T00:00:00Z")
+    target, commitment = approve_action(direct_vm, contract, expires_at="2030-01-01T00:00:00Z")
+    warp_contract_time(direct_vm, "2029-12-31T23:59:59Z")
+    assert contract.can_execute(1, target, commitment) is True
+    warp_contract_time(direct_vm, "2030-01-01T00:00:00Z")
+    assert contract.can_execute(1, target, commitment) is True
+    warp_contract_time(direct_vm, "2030-01-01T00:00:01Z")
+    assert contract.can_execute(1, target, commitment) is False
+    action = contract.get_action(1)
+    assert action.status == "APPROVED"
+    assert action.decision == "PERMITTED"
+
+
+@pytest.mark.parametrize("runtime_value", ["", "not-a-runtime-time"])
+def test_missing_or_malformed_runtime_datetime_fails_closed(direct_vm, direct_deploy, runtime_value):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    target, commitment = approve_action(direct_vm, contract)
+    from genlayer import gl
+    gl.message_raw["datetime"] = runtime_value
+    assert contract.can_execute(1, target, commitment) is False
+
+
+def test_expired_permit_cannot_be_consumed(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, expires_at="2030-01-01T00:00:00Z")
+    target, commitment = approve_action(direct_vm, contract, expires_at="2030-01-01T00:00:00Z")
+    warp_contract_time(direct_vm, "2030-01-01T00:00:01Z")
+    with direct_vm.expect_revert("Permit is not executable"):
+        contract.consume_permit(1, target, commitment)
+
+
+def test_owner_can_revoke_and_revocation_is_irreversible(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    target, commitment = approve_action(direct_vm, contract)
+    contract.revoke_permit(1)
+    assert contract.get_action(1).revoked is True
+    assert contract.can_execute(1, target, commitment) is False
+    with direct_vm.expect_revert("Permit is not executable"):
+        contract.consume_permit(1, target, commitment)
+    with direct_vm.expect_revert("already revoked"):
+        contract.revoke_permit(1)
+
+
+def test_agent_owner_can_revoke(direct_vm, direct_deploy, direct_alice):
+    contract = deploy(direct_deploy)
+    direct_vm.sender = direct_alice
+    create_agent(contract)
+    propose(contract)
+    target, commitment = approve_action(direct_vm, contract)
+    contract.revoke_permit(1)
+    assert contract.get_action(1).revoked is True
+    assert contract.can_execute(1, target, commitment) is False
+
+
+def test_unauthorized_revoke_fails(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    approve_action(direct_vm, contract)
+    direct_vm.sender = "0x2222222222222222222222222222222222222222"
+    with direct_vm.expect_revert("Only the contract or agent owner"):
+        contract.revoke_permit(1)
+
+
+def test_revoking_one_permit_does_not_revoke_another(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, payload="first")
+    propose(contract, payload="second")
+    first_target, first_hash = approve_action(direct_vm, contract, payload="first", action_id=1)
+    second_target, second_hash = approve_action(direct_vm, contract, payload="second", action_id=2)
+    contract.revoke_permit(1)
+    assert contract.can_execute(1, first_target, first_hash) is False
+    assert contract.can_execute(2, second_target, second_hash) is True
+
+
+def test_consumption_is_one_time_and_persisted(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract)
+    target, commitment = approve_action(direct_vm, contract)
+    contract.consume_permit(1, target, commitment)
+    assert contract.get_action(1).consumed is True
+    assert contract.can_execute(1, target, commitment) is False
+    with direct_vm.expect_revert("Permit is not executable"):
+        contract.consume_permit(1, target, commitment)
+    with direct_vm.expect_revert("Permit is not executable"):
+        contract.consume_permit(1, target, payload_hash(PAYLOAD + "x"))
+
+
+def test_consuming_one_permit_does_not_consume_another(direct_vm, direct_deploy):
+    contract = deploy(direct_deploy)
+    create_agent(contract)
+    propose(contract, payload="first")
+    propose(contract, payload="second")
+    first_target, first_hash = approve_action(direct_vm, contract, payload="first", action_id=1)
+    second_target, second_hash = approve_action(direct_vm, contract, payload="second", action_id=2)
+    contract.consume_permit(1, first_target, first_hash)
+    assert contract.get_action(1).consumed is True
+    assert contract.can_execute(2, second_target, second_hash) is True
